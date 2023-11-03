@@ -1,6 +1,4 @@
 from tools import pretrain_run_net as pretrain
-# from tools import pretrain_jepa_run_net as pretrain
-
 from tools import finetune_run_net as finetune
 from tools import test_run_net as test_net
 from utils import parser, dist_utils, misc

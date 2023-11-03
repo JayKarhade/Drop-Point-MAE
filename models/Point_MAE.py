@@ -1,4 +1,3 @@
-from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,48 +9,13 @@ from utils import misc
 from utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
 from utils.logger import *
 import random
-
-#Not using KNN cuda because it does not work properly
 # from knn_cuda import KNN
-from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
-import faiss
-import faiss.contrib.torch_utils
+from pytorch3d.ops import ball_query, knn_gather, knn_points, sample_farthest_points
+from pytorch3d.ops.utils import masked_gather
+from pytorch3d.loss import chamfer_distance
+# from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 
-'''Completely unoptimized KNN class because KNN_CUDA is stupid'''
-class KNN():
-    def __init__(self,k):
-        self.group_size = k
-    
-    def __call__(self,xyz, center):
-        # print(xyz.shape,center.shape)
-        # dist = torch.norm(xyz - center, dim=2, p=None)
-        # knn = dist.topk(self.group_size, largest=False)
 
-        #Looping over batches - #TODO optimize this or find a new library
-
-        output_dist = torch.zeros((xyz.shape[0],center.shape[1],self.group_size)).to(center.device)
-        output_indices = torch.zeros((xyz.shape[0],center.shape[1],self.group_size)).to(center.device)
-
-        for i in range(xyz.shape[0]):
-
-            xb = xyz[i]
-            xq = center[i]
-
-            index = faiss.IndexFlatL2(xyz.shape[-1])
-
-            res = faiss.StandardGpuResources()
-            index = faiss.index_cpu_to_gpu(res, 0 , index)
-
-            index.add(xb)
-            distances, neighbors = index.search(xq, self.group_size)
-            # print(torch.amax(neighbors))
-            output_dist[i] = distances
-            output_indices[i] = neighbors
-
-        output_indices = output_indices.long()
-        # print(torch.amax(output_indices))
-        return output_dist,output_indices
-        
 class Encoder(nn.Module):   ## Embedding module
     def __init__(self, encoder_channel):
         super().__init__()
@@ -92,7 +56,7 @@ class Group(nn.Module):  # FPS + KNN
         self.num_group = num_group
         self.group_size = group_size
         # self.knn = KNN(k=self.group_size, transpose_mode=True)
-        self.knn = KNN(k=self.group_size)
+
     def forward(self, xyz):
         '''
             input: B N 3
@@ -103,25 +67,25 @@ class Group(nn.Module):  # FPS + KNN
         batch_size, num_points, _ = xyz.shape
         # fps the centers out
         center = misc.fps(xyz, self.num_group) # B G 3
+        # print(xyz.shape,center.shape)
         # knn to get the neighborhood
-        _, idx = self.knn(xyz, center) # B G M
-        # print("maxidx",torch.amax(idx))
+        # _, idx = self.knn(xyz, center) # B G M
+        # y = knn_points(xyz,center)
+        # print(y)
+        _,idx,_ = knn_points(center,xyz,K=self.group_size)
+        # idx = all_idx.squeeze(-1)
+        # idx = idx[:,:self.group_size]
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
         idx = idx + idx_base
-        # print(idx_base.shape,idx.shape)
         idx = idx.view(-1)
-        # print(xyz.shape,idx.shape,idx.device)
-        max_idx = torch.amax(idx)
-        max_xyz = (batch_size*num_points)
-        # print(max_xyz,max_idx)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
-        # print(neighborhood.shape)
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
         return neighborhood, center
+
 
 ## Transformers
 class Mlp(nn.Module):
@@ -343,19 +307,14 @@ class MaskTransformer(nn.Module):
             overall_mask[i, :] = mask
         overall_mask = torch.from_numpy(overall_mask).to(torch.bool)
 
-        overall_mask = overall_mask.to(center.device)
-        # print(overall_mask)
-        return overall_mask#.to(center.device) # B G
+        return overall_mask.to(center.device) # B G
 
     def forward(self, neighborhood, center, noaug = False):
-        # print("l306", center.device,neighborhood.device)
         # generate mask
         if self.mask_type == 'rand':
             bool_masked_pos = self._mask_center_rand(center, noaug = noaug) # B G
         else:
             bool_masked_pos = self._mask_center_block(center, noaug = noaug)
-
-        # bool_masked_pos = bool_masked_pos.to(center.device)
 
         group_input_tokens = self.encoder(neighborhood)  #  B G C
 
@@ -419,17 +378,19 @@ class Point_MAE(nn.Module):
         self.build_loss_func(self.loss)
 
     def build_loss_func(self, loss_type):
-        if loss_type == "cdl1":
-            self.loss_func = ChamferDistanceL1().cuda()
-        elif loss_type =='cdl2':
-            self.loss_func = ChamferDistanceL2().cuda()
-        else:
-            raise NotImplementedError
+        return
+        # if loss_type == "cdl1":
+        #     self.loss_func = ChamferDistanceL1().cuda()
+        # elif loss_type =='cdl2':
+        #     self.loss_func = ChamferDistanceL2().cuda()
+        # else:
+        #     raise NotImplementedError
             # self.loss_func = emd().cuda()
 
 
     def forward(self, pts, vis = False, **kwargs):
         neighborhood, center = self.group_divider(pts)
+
         x_vis, mask = self.MAE_encoder(neighborhood, center)
         B,_,C = x_vis.shape # B VIS C
 
@@ -448,22 +409,22 @@ class Point_MAE(nn.Module):
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
 
         gt_points = neighborhood[mask].reshape(B*M,-1,3)
-        loss1 = self.loss_func(rebuild_points, gt_points)
-
-        if vis: #visualization
-            vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)
-            full_vis = vis_points + center[~mask].unsqueeze(1)
-            full_rebuild = rebuild_points + center[mask].unsqueeze(1)
-            full = torch.cat([full_vis, full_rebuild], dim=0)
-            # full_points = torch.cat([rebuild_points,vis_points], dim=0)
-            full_center = torch.cat([center[mask], center[~mask]], dim=0)
-            # full = full_points + full_center.unsqueeze(1)
-            ret2 = full_vis.reshape(-1, 3).unsqueeze(0)
-            ret1 = full.reshape(-1, 3).unsqueeze(0)
-            # return ret1, ret2
-            return ret1, ret2, full_center
-        else:
-            return loss1
+        loss1,_ = chamfer_distance(rebuild_points,gt_points)
+        # loss1 = self.loss_func(rebuild_points, gt_points)
+        # if vis: #visualization
+        #     vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)
+        #     full_vis = vis_points + center[~mask].unsqueeze(1)
+        #     full_rebuild = rebuild_points + center[mask].unsqueeze(1)
+        #     full = torch.cat([full_vis, full_rebuild], dim=0)
+        #     # full_points = torch.cat([rebuild_points,vis_points], dim=0)
+        #     full_center = torch.cat([center[mask], center[~mask]], dim=0)
+        #     # full = full_points + full_center.unsqueeze(1)
+        #     ret2 = full_vis.reshape(-1, 3).unsqueeze(0)
+        #     ret1 = full.reshape(-1, 3).unsqueeze(0)
+        #     # return ret1, ret2
+        #     return ret1, ret2, full_center
+        # else:
+        return loss1
 
 # finetune model
 @MODELS.register_module()

@@ -7,7 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 from collections import abc
-from pointnet2_ops import pointnet2_utils
+# from pointnet2_ops import pointnet2_utils
+from pytorch3d.ops import sample_farthest_points
+from pytorch3d.ops.utils import masked_gather
+from pytorch3d.transforms import euler_angles_to_matrix
 
 
 def fps(data, number):
@@ -15,8 +18,11 @@ def fps(data, number):
         data B N 3
         number int
     '''
-    fps_idx = pointnet2_utils.furthest_point_sample(data, number) 
-    fps_data = pointnet2_utils.gather_operation(data.transpose(1, 2).contiguous(), fps_idx).transpose(1,2).contiguous()
+    # fps_idx = pointnet2_utils.furthest_point_sample(data, number) 
+    # fps_data = pointnet2_utils.gather_operation(data.transpose(1, 2).contiguous(), fps_idx).transpose(1,2).contiguous()
+    _, fps_idx = sample_farthest_points(data,K=number)
+    fps_data = masked_gather(data,fps_idx).contiguous()
+
     return fps_data
 
 

@@ -8,7 +8,10 @@ from utils.AverageMeter import AverageMeter
 
 import numpy as np
 from datasets import data_transforms
-from pointnet2_ops import pointnet2_utils
+# from pointnet2_ops import pointnet2_utils
+from pytorch3d.ops import ball_query, knn_gather, knn_points, sample_farthest_points
+from pytorch3d.ops.utils import masked_gather
+
 from torchvision import transforms
 
 
@@ -138,9 +141,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
             if points.size(1) < point_all:
                 point_all = points.size(1)
 
-            fps_idx = pointnet2_utils.furthest_point_sample(points, point_all)  # (B, npoint)
+            _,fps_idx = sample_farthest_points(points, K=point_all)  # (B, npoint)
             fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
-            points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
+            # points = masked_gather(points.transpose(1, 2).contiguous(), fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
+            points = masked_gather(points,fps_idx).contiguous()
             # import pdb; pdb.set_trace()
             points = train_transforms(points)
 
@@ -291,14 +295,14 @@ def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, 
             if points_raw.size(1) < point_all:
                 point_all = points_raw.size(1)
 
-            fps_idx_raw = pointnet2_utils.furthest_point_sample(points_raw, point_all)  # (B, npoint)
+            _,fps_idx_raw = sample_farthest_points(points_raw,K= point_all)  # (B, npoint)
             local_pred = []
 
             for kk in range(times):
                 fps_idx = fps_idx_raw[:, np.random.choice(point_all, npoints, False)]
-                points = pointnet2_utils.gather_operation(points_raw.transpose(1, 2).contiguous(), 
-                                                        fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
-
+                # points = masked_gather(points_raw.transpose(1, 2).contiguous(), 
+                #                                         fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
+                points = masked_gather(points_raw,fps_idx).contiguous()
                 points = test_transforms(points)
 
                 logits = base_model(points)
@@ -419,14 +423,14 @@ def test_vote(base_model, test_dataloader, epoch, val_writer, args, config, logg
             if points_raw.size(1) < point_all:
                 point_all = points_raw.size(1)
 
-            fps_idx_raw = pointnet2_utils.furthest_point_sample(points_raw, point_all)  # (B, npoint)
+            _,fps_idx_raw = sample_farthest_points(points_raw,K= point_all)  # (B, npoint)
             local_pred = []
 
             for kk in range(times):
                 fps_idx = fps_idx_raw[:, np.random.choice(point_all, npoints, False)]
-                points = pointnet2_utils.gather_operation(points_raw.transpose(1, 2).contiguous(), 
-                                                        fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
-
+                # points = masked_gather(points_raw.transpose(1, 2).contiguous(), 
+                #                                         fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
+                points = masked_gather(points_raw,fps_idx).contiguous()
                 points = test_transforms(points)
 
                 logits = base_model(points)

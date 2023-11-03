@@ -1,6 +1,3 @@
-"""Implementation of Drop Point but for Point Clouds"""
-
-from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,48 +9,13 @@ from utils import misc
 from utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
 from utils.logger import *
 import random
-
-#Not using KNN cuda because it does not work properly
 # from knn_cuda import KNN
-from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
-import faiss
-import faiss.contrib.torch_utils
+from pytorch3d.ops import ball_query, knn_gather, knn_points, sample_farthest_points
+from pytorch3d.ops.utils import masked_gather
+from pytorch3d.loss import chamfer_distance
+# from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 
-'''Completely unoptimized KNN class because KNN_CUDA is stupid'''
-class KNN():
-    def __init__(self,k):
-        self.group_size = k
-    
-    def __call__(self,xyz, center):
-        # print(xyz.shape,center.shape)
-        # dist = torch.norm(xyz - center, dim=2, p=None)
-        # knn = dist.topk(self.group_size, largest=False)
 
-        #Looping over batches - #TODO optimize this or find a new library
-
-        output_dist = torch.zeros((xyz.shape[0],center.shape[1],self.group_size)).to(center.device)
-        output_indices = torch.zeros((xyz.shape[0],center.shape[1],self.group_size)).to(center.device)
-
-        for i in range(xyz.shape[0]):
-
-            xb = xyz[i]
-            xq = center[i]
-
-            index = faiss.IndexFlatL2(xyz.shape[-1])
-
-            res = faiss.StandardGpuResources()
-            index = faiss.index_cpu_to_gpu(res, 0 , index)
-
-            index.add(xb)
-            distances, neighbors = index.search(xq, self.group_size)
-            # print(torch.amax(neighbors))
-            output_dist[i] = distances
-            output_indices[i] = neighbors
-
-        output_indices = output_indices.long()
-        # print(torch.amax(output_indices))
-        return output_dist,output_indices
-        
 class Encoder(nn.Module):   ## Embedding module
     def __init__(self, encoder_channel):
         super().__init__()
@@ -94,7 +56,7 @@ class Group(nn.Module):  # FPS + KNN
         self.num_group = num_group
         self.group_size = group_size
         # self.knn = KNN(k=self.group_size, transpose_mode=True)
-        self.knn = KNN(k=self.group_size)
+
     def forward(self, xyz):
         '''
             input: B N 3
@@ -105,25 +67,25 @@ class Group(nn.Module):  # FPS + KNN
         batch_size, num_points, _ = xyz.shape
         # fps the centers out
         center = misc.fps(xyz, self.num_group) # B G 3
+        # print(xyz.shape,center.shape)
         # knn to get the neighborhood
-        _, idx = self.knn(xyz, center) # B G M
-        # print("maxidx",torch.amax(idx))
+        # _, idx = self.knn(xyz, center) # B G M
+        # y = knn_points(xyz,center)
+        # print(y)
+        _,idx,_ = knn_points(center,xyz,K=self.group_size)
+        # idx = all_idx.squeeze(-1)
+        # idx = idx[:,:self.group_size]
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
         idx = idx + idx_base
-        # print(idx_base.shape,idx.shape)
         idx = idx.view(-1)
-        # print(xyz.shape,idx.shape,idx.device)
-        max_idx = torch.amax(idx)
-        max_xyz = (batch_size*num_points)
-        # print(max_xyz,max_idx)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
-        # print(neighborhood.shape)
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
         return neighborhood, center
+
 
 ## Transformers
 class Mlp(nn.Module):
@@ -210,6 +172,7 @@ class TransformerEncoder(nn.Module):
         for _, block in enumerate(self.blocks):
             x = block(x + pos)
         return x
+
 
 class TransformerPredictor(nn.Module):
     def __init__(self, embed_dim=768, depth=4, num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None,
@@ -465,13 +428,13 @@ class Drop_Point_MAE(nn.Module):
         self.build_loss_func(self.loss)
 
     def build_loss_func(self, loss_type):
-        if loss_type == "cdl1":
-            self.loss_func = ChamferDistanceL1().cuda()
-        elif loss_type =='cdl2':
-            self.loss_func = ChamferDistanceL2().cuda()
-        else:
-            raise NotImplementedError
-            # self.loss_func = emd().cuda()
+        return
+        # if loss_type == "cdl1":
+        #     self.loss_func = ChamferDistanceL1().cuda()
+        # elif loss_type =='cdl2':
+        #     self.loss_func = ChamferDistanceL2().cuda()
+        # else:
+        #     raise NotImplementedError
 
 
     def forward(self, pts, vis = False, **kwargs):
@@ -482,10 +445,6 @@ class Drop_Point_MAE(nn.Module):
     
         predicted_pos = self.increase_dim(self.predictor(x_vis)) #predicted the positions - BXdrop_posXtrans_dim
         
-        # print(predicted_pos.shape)
-
-        # print(vis_centers.shape)
-
         pred_pos = predicted_pos[drop_pos_mask].reshape(B,-1,3)
         
         gt_centers = vis_centers[drop_pos_mask].reshape(B,-1,3)
@@ -624,3 +583,135 @@ class PointTransformer(nn.Module):
         concat_f = torch.cat([x[:, 0], x[:, 1:].max(1)[0]], dim=-1)
         ret = self.cls_head_finetune(concat_f)
         return ret
+
+
+# visualization encoder model
+@MODELS.register_module()
+class VizTransformer(nn.Module):
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.trans_dim = config.trans_dim
+        self.depth = config.depth
+        self.drop_path_rate = config.drop_path_rate
+        self.cls_dim = config.cls_dim
+        self.num_heads = config.num_heads
+
+        self.group_size = config.group_size
+        self.num_group = config.num_group
+        self.encoder_dims = config.encoder_dims
+
+        self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
+
+        self.encoder = Encoder(encoder_channel=self.encoder_dims)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
+        self.cls_pos = nn.Parameter(torch.randn(1, 1, self.trans_dim))
+
+        self.pos_embed = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+            nn.Linear(128, self.trans_dim)
+        )
+
+        dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)]
+        self.blocks = TransformerEncoder(
+            embed_dim=self.trans_dim,
+            depth=self.depth,
+            drop_path_rate=dpr,
+            num_heads=self.num_heads,
+        )
+
+        self.norm = nn.LayerNorm(self.trans_dim)
+
+        self.cls_head_finetune = nn.Sequential(
+                nn.Linear(self.trans_dim * 2, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.5),
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.5),
+                nn.Linear(256, self.cls_dim)
+            )
+
+        self.build_loss_func()
+
+        trunc_normal_(self.cls_token, std=.02)
+        trunc_normal_(self.cls_pos, std=.02)
+
+    def build_loss_func(self):
+        self.loss_ce = nn.CrossEntropyLoss()
+
+    def get_loss_acc(self, ret, gt):
+        loss = self.loss_ce(ret, gt.long())
+        pred = ret.argmax(-1)
+        acc = (pred == gt).sum() / float(gt.size(0))
+        return loss, acc * 100
+
+    def load_model_from_ckpt(self, bert_ckpt_path):
+        if bert_ckpt_path is not None:
+            ckpt = torch.load(bert_ckpt_path)
+            base_ckpt = {k.replace("module.", ""): v for k, v in ckpt['base_model'].items()}
+
+            for k in list(base_ckpt.keys()):
+                if k.startswith('MAE_encoder') :
+                    base_ckpt[k[len('MAE_encoder.'):]] = base_ckpt[k]
+                    del base_ckpt[k]
+                elif k.startswith('base_model'):
+                    base_ckpt[k[len('base_model.'):]] = base_ckpt[k]
+                    del base_ckpt[k]
+
+            incompatible = self.load_state_dict(base_ckpt, strict=False)
+
+            if incompatible.missing_keys:
+                print_log('missing_keys', logger='Transformer')
+                print_log(
+                    get_missing_parameters_message(incompatible.missing_keys),
+                    logger='Transformer'
+                )
+            if incompatible.unexpected_keys:
+                print_log('unexpected_keys', logger='Transformer')
+                print_log(
+                    get_unexpected_parameters_message(incompatible.unexpected_keys),
+                    logger='Transformer'
+                )
+
+            print_log(f'[Transformer] Successful Loading the ckpt from {bert_ckpt_path}', logger='Transformer')
+        else:
+            print_log('Training from scratch!!!', logger='Transformer')
+            self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv1d):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, pts):
+
+        neighborhood, center = self.group_divider(pts)
+        group_input_tokens = self.encoder(neighborhood)  # B G N
+
+        cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)
+        cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)
+
+        pos = self.pos_embed(center)
+
+        x = torch.cat((cls_tokens, group_input_tokens), dim=1)
+        pos = torch.cat((cls_pos, pos), dim=1)
+        # transformer
+        x = self.blocks(x, pos)
+        x = self.norm(x)
+
+        return x
+
